@@ -67,6 +67,19 @@ def ensure_private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
+def ensure_directory(path: Path) -> None:
+    """Create a caller-owned directory without changing its permissions."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not path.is_dir():
+        raise SwapError(f"not a directory: {path}")
+
+
+def ensure_swap_dirs() -> None:
+    """Create and secure only the directories owned by codex-swap."""
+    ensure_private_dir(data_home())
+    ensure_private_dir(profiles_dir())
+
+
 def check_source(path: Path) -> None:
     if not path.exists():
         raise SwapError(f"no Codex login found at {path}; run 'codex login' first")
@@ -87,7 +100,9 @@ def read_bytes(path: Path) -> bytes:
 
 
 def atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
-    ensure_private_dir(path.parent)
+    # The destination may live below a user-controlled CODEX_HOME, including
+    # one reached through a symlink. Do not reject or chmod its parent.
+    ensure_directory(path.parent)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(tmp_name)
     try:
@@ -125,7 +140,7 @@ def set_active(name: str | None) -> None:
 
 @contextlib.contextmanager
 def locked() -> Iterator[None]:
-    ensure_private_dir(data_home())
+    ensure_swap_dirs()
     lock_path = data_home() / ".lock"
     with lock_path.open("a+b") as handle:
         os.chmod(lock_path, 0o600)
@@ -206,6 +221,11 @@ def cmd_switch(args: argparse.Namespace) -> int:
             print(f"'{name}' is already active.")
             return 0
         live = auth_path()
+        if current is None and live.exists() and not args.force:
+            raise SwapError(
+                "the current Codex login is not associated with a saved profile; "
+                "save it with 'codex-swap add NAME' or use --force to overwrite it"
+            )
         if current and live.exists():
             save_live_profile(current)
         payload = read_bytes(target)
@@ -219,13 +239,13 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    ensure_private_dir(profiles_dir())
+    ensure_swap_dirs()
     active = get_active()
     rows = []
     for path in sorted(profiles_dir().glob("*.json")):
         try:
             info = describe(read_bytes(path))
-        except SwapError:
+        except (SwapError, OSError):
             info = {"mode": "invalid", "email": None}
         rows.append(
             {
@@ -251,10 +271,31 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     active = get_active()
     live = auth_path()
-    info = describe(read_bytes(live)) if live.exists() else {"mode": None, "email": None}
-    result = {"active": active, "mode": info["mode"], "email": info["email"]}
+    credential_status = "missing"
+    error = None
+    info = {"mode": None, "email": None}
+    if live.exists():
+        try:
+            info = describe(read_bytes(live))
+            credential_status = "valid"
+        except (SwapError, OSError) as exc:
+            credential_status = "invalid"
+            error = str(exc)
+            info = {"mode": "invalid", "email": None}
+    result = {
+        "active": active,
+        "mode": info["mode"],
+        "email": info["email"],
+        "credentialStatus": credential_status,
+    }
+    if error:
+        result["error"] = error
     if args.json:
         print(json.dumps(result, indent=2))
+    elif credential_status == "invalid":
+        profile = active or "none"
+        print(f"Active profile: {profile} (credentials invalid)")
+        print(f"Credential problem: {error}")
     elif active:
         details = info["email"] or info["mode"] or "account details unavailable"
         print(f"Active profile: {active} ({details})")
@@ -286,6 +327,12 @@ def cmd_login(args: argparse.Namespace) -> int:
         target = profile_path(args.name)
         if target.exists() and not args.force:
             raise SwapError(f"profile '{args.name}' already exists; use --force to replace it")
+        live = auth_path()
+        if get_active() is None and live.exists() and not args.force:
+            raise SwapError(
+                "the current Codex login is not associated with a saved profile; "
+                "save it with 'codex-swap add NAME' or use --force to overwrite it"
+            )
         ensure_private_dir(data_home())
         config = 'cli_auth_credentials_store="file"'
         print(f"Sign in to the account you want to save as '{args.name}'.")
@@ -305,7 +352,6 @@ def cmd_login(args: argparse.Namespace) -> int:
         # The browser flow happened in an isolated CODEX_HOME, so the current
         # account was never logged out. Preserve its latest refresh token, then
         # activate the newly enrolled profile atomically.
-        live = auth_path()
         previous_active = get_active()
         if previous_active and live.exists():
             save_live_profile(previous_active)
@@ -331,7 +377,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     switch = sub.add_parser("switch", aliases=["use"], help="activate a saved profile")
     switch.add_argument("name", nargs="?", help="profile name; omit to rotate to the next one")
-    switch.add_argument("--force", action="store_true", help="rewrite even if already active")
+    switch.add_argument(
+        "--force",
+        action="store_true",
+        help="rewrite even if active, or overwrite an untracked live login",
+    )
     switch.set_defaults(func=cmd_switch)
 
     login = sub.add_parser("login", help="run Codex login, then save it as a profile")

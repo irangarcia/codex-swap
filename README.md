@@ -19,6 +19,8 @@ name, or toggle to the next profile with a single command.
 - Switch directly to `personal`, `work`, or any other saved profile.
 - Toggle through profiles by running `codex-swap switch` without a name.
 - Preserve refreshed credentials when leaving the active profile.
+- Refuse to overwrite a live login that is not associated with a saved
+  profile unless `--force` is explicit.
 - Inspect profiles with human-readable or JSON output.
 - Protect credential files with private permissions, locking, and atomic
   replacement.
@@ -193,6 +195,10 @@ snapshot while leaving the current Codex login in place:
 codex-swap remove personal --force
 ```
 
+After this command, the live login is intentionally untracked. A subsequent
+switch is blocked until you save it with `codex-swap add NAME` or explicitly
+allow replacement with `codex-swap switch PROFILE --force`.
+
 ## Command reference
 
 ```text
@@ -221,9 +227,11 @@ When you add or switch an account, `codex-swap`:
 1. Takes an inter-process lock so two switches cannot overlap.
 2. Saves the active `auth.json` back to its profile, preserving any refresh
    token updates Codex made during use.
-3. Writes the selected profile to the live Codex credential path using atomic
+3. Refuses to overwrite an existing live login when there is no active-profile
+   marker, unless `--force` was supplied.
+4. Writes the selected profile to the live Codex credential path using atomic
    file replacement.
-4. Records which named profile is active.
+5. Records which named profile is active.
 
 When you run `codex-swap login NAME`, the browser login uses a temporary,
 isolated `CODEX_HOME`. It never runs `codex logout`, because logging out can
