@@ -15,9 +15,9 @@ CLI = Path(__file__).resolve().parents[1] / "codex-swap"
 class CliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        self.codex_home = root / "codex"
-        self.swap_home = root / "swap"
+        self.root = Path(self.temp.name)
+        self.codex_home = self.root / "codex"
+        self.swap_home = self.root / "swap"
         self.codex_home.mkdir()
         self.env = os.environ.copy()
         self.env.update(
@@ -49,6 +49,21 @@ class CliTests(unittest.TestCase):
             self.fail(f"command failed: {result.stderr}")
         return result
 
+    def install_fake_codex(self, label: str = "work") -> None:
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        fake_codex = fake_bin / "codex"
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"logout\" ]; then exit 91; fi\n"
+            "mkdir -p \"$CODEX_HOME\"\n"
+            "printf '%s' '{\"auth_mode\":\"chatgpt\",\"tokens\":"
+            f"{{\"access_token\":\"fake-{label}\"}},\"OPENAI_API_KEY\":null}}' "
+            "> \"$CODEX_HOME/auth.json\"\n"
+        )
+        fake_codex.chmod(0o755)
+        self.env["PATH"] = f"{fake_bin}:{self.env['PATH']}"
+
     def test_add_switch_and_preserve_refreshed_token(self) -> None:
         self.write_auth("personal-v1")
         self.run_cli("add", "personal")
@@ -71,6 +86,9 @@ class CliTests(unittest.TestCase):
         profile = self.swap_home / "profiles" / "personal.json"
         self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.swap_home.stat().st_mode), 0o700)
+        self.assertEqual(
+            stat.S_IMODE((self.swap_home / "profiles").stat().st_mode), 0o700
+        )
 
     def test_json_list(self) -> None:
         self.write_auth("personal")
@@ -99,23 +117,80 @@ class CliTests(unittest.TestCase):
         result = self.run_cli("remove", "personal", ok=False)
         self.assertIn("active profile", result.stderr)
 
+    def test_switch_refuses_to_overwrite_untracked_live_login(self) -> None:
+        self.write_auth("personal")
+        self.run_cli("add", "personal")
+        self.write_auth("work")
+        self.run_cli("add", "work")
+        self.run_cli("remove", "work", "--force")
+
+        result = self.run_cli("switch", "personal", ok=False)
+        self.assertIn("not associated with a saved profile", result.stderr)
+        live = json.loads((self.codex_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-work")
+
+        self.run_cli("switch", "personal", "--force")
+        live = json.loads((self.codex_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-personal")
+
+    def test_login_refuses_to_overwrite_untracked_live_login(self) -> None:
+        self.write_auth("personal")
+        self.install_fake_codex("work")
+
+        result = self.run_cli("login", "work", ok=False)
+        self.assertIn("not associated with a saved profile", result.stderr)
+        live = json.loads((self.codex_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-personal")
+
+    def test_status_reports_malformed_credentials_without_failing(self) -> None:
+        (self.codex_home / "auth.json").write_text("{broken")
+
+        human = self.run_cli("status")
+        self.assertIn("credentials invalid", human.stdout)
+        payload = json.loads(self.run_cli("status", "--json").stdout)
+        self.assertEqual(payload["credentialStatus"], "invalid")
+        self.assertEqual(payload["mode"], "invalid")
+
+    def test_symlinked_codex_home_switches_without_chmod(self) -> None:
+        self.codex_home.rmdir()
+        real_home = self.root / "real-codex"
+        real_home.mkdir(mode=0o755)
+        real_home.chmod(0o755)
+        self.codex_home.symlink_to(real_home, target_is_directory=True)
+
+        self.write_auth("personal")
+        self.run_cli("add", "personal")
+        self.write_auth("work")
+        self.run_cli("add", "work")
+        self.run_cli("switch", "personal")
+
+        self.assertTrue(self.codex_home.is_symlink())
+        self.assertEqual(stat.S_IMODE(real_home.stat().st_mode), 0o755)
+        live = json.loads((real_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-personal")
+
+    def test_symlinked_codex_home_supports_login_without_chmod(self) -> None:
+        self.codex_home.rmdir()
+        real_home = self.root / "real-codex"
+        real_home.mkdir(mode=0o755)
+        real_home.chmod(0o755)
+        self.codex_home.symlink_to(real_home, target_is_directory=True)
+
+        self.write_auth("personal")
+        self.run_cli("add", "personal")
+        self.install_fake_codex("work")
+        self.run_cli("login", "work")
+
+        self.assertTrue(self.codex_home.is_symlink())
+        self.assertEqual(stat.S_IMODE(real_home.stat().st_mode), 0o755)
+        live = json.loads((real_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-work")
+
     def test_login_is_isolated_and_never_calls_logout(self) -> None:
         self.write_auth("personal")
         self.run_cli("add", "personal")
 
-        fake_bin = Path(self.temp.name) / "bin"
-        fake_bin.mkdir()
-        fake_codex = fake_bin / "codex"
-        fake_codex.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = \"logout\" ]; then exit 91; fi\n"
-            "mkdir -p \"$CODEX_HOME\"\n"
-            "printf '%s' '{\"auth_mode\":\"chatgpt\",\"tokens\":"
-            "{\"access_token\":\"fake-work\"},\"OPENAI_API_KEY\":null}' "
-            "> \"$CODEX_HOME/auth.json\"\n"
-        )
-        fake_codex.chmod(0o755)
-        self.env["PATH"] = f"{fake_bin}:{self.env['PATH']}"
+        self.install_fake_codex("work")
 
         self.run_cli("login", "work")
         live = json.loads((self.codex_home / "auth.json").read_text())
