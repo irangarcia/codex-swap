@@ -40,11 +40,11 @@ it does not provide usage dashboards or automatic rate-limit rotation.
 
 ### curl (quickest)
 
-Install the pinned `0.1.0` release to `/usr/local/bin`:
+Install the pinned `0.2.0` release to `/usr/local/bin`:
 
 ```sh
 sudo curl -fsSL \
-  https://raw.githubusercontent.com/irangarcia/codex-swap/0.1.0/codex-swap \
+  https://raw.githubusercontent.com/irangarcia/codex-swap/0.2.0/codex-swap \
   -o /usr/local/bin/codex-swap
 sudo chmod 755 /usr/local/bin/codex-swap
 ```
