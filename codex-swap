@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Switch between named Codex CLI authentication profiles."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Iterator
+
+
+VERSION = "0.1.0"
+PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class SwapError(Exception):
+    pass
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+
+
+def data_home() -> Path:
+    override = os.environ.get("CODEX_SWAP_HOME")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    root = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return root / "codex-swap"
+
+
+def auth_path() -> Path:
+    return codex_home() / "auth.json"
+
+
+def profiles_dir() -> Path:
+    return data_home() / "profiles"
+
+
+def profile_path(name: str) -> Path:
+    validate_name(name)
+    return profiles_dir() / f"{name}.json"
+
+
+def validate_name(name: str) -> None:
+    if not PROFILE_RE.fullmatch(name):
+        raise SwapError(
+            "profile names must be 1-64 characters and contain only letters, "
+            "numbers, dot, underscore, or hyphen"
+        )
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or not path.is_dir():
+        raise SwapError(f"unsafe data directory: {path}")
+    path.chmod(0o700)
+
+
+def check_source(path: Path) -> None:
+    if not path.exists():
+        raise SwapError(f"no Codex login found at {path}; run 'codex login' first")
+    if path.is_symlink() or not path.is_file():
+        raise SwapError(f"refusing to use non-regular credential file: {path}")
+
+
+def read_bytes(path: Path) -> bytes:
+    check_source(path)
+    payload = path.read_bytes()
+    try:
+        parsed = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SwapError(f"credential file is not valid JSON: {path}") from exc
+    if not isinstance(parsed, dict) or not ("tokens" in parsed or "OPENAI_API_KEY" in parsed):
+        raise SwapError(f"file does not look like Codex credentials: {path}")
+    return payload
+
+
+def atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    ensure_private_dir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        path.chmod(mode)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def marker_path() -> Path:
+    return data_home() / "active"
+
+
+def get_active() -> str | None:
+    marker = marker_path()
+    if not marker.exists():
+        return None
+    value = marker.read_text(encoding="utf-8").strip()
+    return value if PROFILE_RE.fullmatch(value) else None
+
+
+def set_active(name: str | None) -> None:
+    marker = marker_path()
+    if name is None:
+        marker.unlink(missing_ok=True)
+    else:
+        atomic_write(marker, f"{name}\n".encode(), 0o600)
+
+
+@contextlib.contextmanager
+def locked() -> Iterator[None]:
+    ensure_private_dir(data_home())
+    lock_path = data_home() / ".lock"
+    with lock_path.open("a+b") as handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def save_live_profile(name: str) -> None:
+    atomic_write(profile_path(name), read_bytes(auth_path()))
+
+
+def jwt_claims(token: str) -> dict[str, Any]:
+    try:
+        body = token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        result = json.loads(base64.urlsafe_b64decode(body))
+        return result if isinstance(result, dict) else {}
+    except (IndexError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def find_claim(value: Any, keys: set[str]) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.lower() in keys and isinstance(child, str) and child:
+                return child
+        for child in value.values():
+            found = find_claim(child, keys)
+            if found:
+                return found
+    return None
+
+
+def describe(payload: bytes) -> dict[str, str | None]:
+    data = json.loads(payload)
+    mode = data.get("auth_mode")
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    claims: dict[str, Any] = {}
+    for key in ("id_token", "access_token"):
+        token = tokens.get(key)
+        if isinstance(token, str):
+            claims.update(jwt_claims(token))
+    email = find_claim(claims, {"email", "email_address"})
+    return {"mode": str(mode) if mode else None, "email": email}
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    target = profile_path(args.name)
+    with locked():
+        if target.exists() and not args.force:
+            raise SwapError(f"profile '{args.name}' already exists; use --force to replace it")
+        payload = read_bytes(auth_path())
+        atomic_write(target, payload)
+        set_active(args.name)
+    info = describe(payload)
+    suffix = f" ({info['email']})" if info["email"] else ""
+    print(f"Saved current Codex login as '{args.name}'{suffix}.")
+    return 0
+
+
+def cmd_switch(args: argparse.Namespace) -> int:
+    with locked():
+        name = args.name
+        if name is None:
+            names = sorted(path.stem for path in profiles_dir().glob("*.json"))
+            if not names:
+                raise SwapError("no profiles saved; run 'codex-swap add personal'")
+            current_for_rotation = get_active()
+            if current_for_rotation in names:
+                name = names[(names.index(current_for_rotation) + 1) % len(names)]
+            else:
+                name = names[0]
+        target = profile_path(name)
+        if not target.exists():
+            raise SwapError(f"unknown profile '{name}'; run 'codex-swap list'")
+        current = get_active()
+        if current == name and not args.force:
+            print(f"'{name}' is already active.")
+            return 0
+        live = auth_path()
+        if current and live.exists():
+            save_live_profile(current)
+        payload = read_bytes(target)
+        atomic_write(live, payload)
+        set_active(name)
+    info = describe(payload)
+    suffix = f" ({info['email']})" if info["email"] else ""
+    print(f"Switched Codex to '{name}'{suffix}.")
+    print("Start a new Codex session so it reads the selected credentials.")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    ensure_private_dir(profiles_dir())
+    active = get_active()
+    rows = []
+    for path in sorted(profiles_dir().glob("*.json")):
+        try:
+            info = describe(read_bytes(path))
+        except SwapError:
+            info = {"mode": "invalid", "email": None}
+        rows.append(
+            {
+                "name": path.stem,
+                "active": path.stem == active,
+                "mode": info["mode"],
+                "email": info["email"],
+            }
+        )
+    if args.json:
+        print(json.dumps({"active": active, "profiles": rows}, indent=2))
+        return 0
+    if not rows:
+        print("No profiles saved. Run 'codex-swap add personal'.")
+        return 0
+    for row in rows:
+        marker = "*" if row["active"] else " "
+        details = row["email"] or row["mode"] or "unknown account"
+        print(f"{marker} {row['name']:<16} {details}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    active = get_active()
+    live = auth_path()
+    info = describe(read_bytes(live)) if live.exists() else {"mode": None, "email": None}
+    result = {"active": active, "mode": info["mode"], "email": info["email"]}
+    if args.json:
+        print(json.dumps(result, indent=2))
+    elif active:
+        details = info["email"] or info["mode"] or "account details unavailable"
+        print(f"Active profile: {active} ({details})")
+    else:
+        print("The current Codex login is not associated with a saved profile.")
+    return 0
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    target = profile_path(args.name)
+    with locked():
+        if not target.exists():
+            raise SwapError(f"unknown profile '{args.name}'")
+        if get_active() == args.name and not args.force:
+            raise SwapError("refusing to remove the active profile; switch first or use --force")
+        target.unlink()
+        if get_active() == args.name:
+            set_active(None)
+    print(f"Removed profile '{args.name}'. The current Codex login was not logged out.")
+    return 0
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    validate_name(args.name)
+    codex = shutil.which("codex")
+    if not codex:
+        raise SwapError("could not find 'codex' in PATH")
+    with locked():
+        target = profile_path(args.name)
+        if target.exists() and not args.force:
+            raise SwapError(f"profile '{args.name}' already exists; use --force to replace it")
+        ensure_private_dir(data_home())
+        config = 'cli_auth_credentials_store="file"'
+        print(f"Sign in to the account you want to save as '{args.name}'.")
+        with tempfile.TemporaryDirectory(prefix=".login-", dir=data_home()) as temp_name:
+            login_home = Path(temp_name)
+            login_env = os.environ.copy()
+            login_env["CODEX_HOME"] = str(login_home)
+            result = subprocess.run(
+                [codex, "login", "-c", config],
+                env=login_env,
+            )
+            isolated_auth = login_home / "auth.json"
+            if result.returncode != 0 or not isolated_auth.exists():
+                raise SwapError("Codex login failed; the active login was not changed")
+            payload = read_bytes(isolated_auth)
+
+        # The browser flow happened in an isolated CODEX_HOME, so the current
+        # account was never logged out. Preserve its latest refresh token, then
+        # activate the newly enrolled profile atomically.
+        live = auth_path()
+        previous_active = get_active()
+        if previous_active and live.exists():
+            save_live_profile(previous_active)
+        atomic_write(target, payload)
+        atomic_write(live, payload)
+        set_active(args.name)
+    print(f"Saved and activated '{args.name}'.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-swap",
+        description="Safely switch between named Codex CLI login profiles.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="save the current Codex login as a profile")
+    add.add_argument("name")
+    add.add_argument("--force", action="store_true", help="replace an existing profile")
+    add.set_defaults(func=cmd_add)
+
+    switch = sub.add_parser("switch", aliases=["use"], help="activate a saved profile")
+    switch.add_argument("name", nargs="?", help="profile name; omit to rotate to the next one")
+    switch.add_argument("--force", action="store_true", help="rewrite even if already active")
+    switch.set_defaults(func=cmd_switch)
+
+    login = sub.add_parser("login", help="run Codex login, then save it as a profile")
+    login.add_argument("name")
+    login.add_argument("--force", action="store_true", help="replace an existing profile")
+    login.set_defaults(func=cmd_login)
+
+    listing = sub.add_parser("list", help="list saved profiles")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    status = sub.add_parser("status", help="show the selected profile")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    remove = sub.add_parser("remove", aliases=["rm"], help="delete a saved profile")
+    remove.add_argument("name")
+    remove.add_argument("--force", action="store_true", help="allow removing the active snapshot")
+    remove.set_defaults(func=cmd_remove)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        return args.func(args)
+    except (SwapError, OSError) as exc:
+        print(f"codex-swap: error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
