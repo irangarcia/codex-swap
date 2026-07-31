@@ -130,6 +130,14 @@ def get_active() -> str | None:
     return value if PROFILE_RE.fullmatch(value) else None
 
 
+def get_tracked_active() -> str | None:
+    """Return the active profile only when its saved credentials still exist."""
+    active = get_active()
+    if active is None or not profile_path(active).exists():
+        return None
+    return active
+
+
 def set_active(name: str | None) -> None:
     marker = marker_path()
     if name is None:
@@ -216,7 +224,7 @@ def cmd_switch(args: argparse.Namespace) -> int:
         target = profile_path(name)
         if not target.exists():
             raise SwapError(f"unknown profile '{name}'; run 'codex-swap list'")
-        current = get_active()
+        current = get_tracked_active()
         if current == name and not args.force:
             print(f"'{name}' is already active.")
             return 0
@@ -328,7 +336,8 @@ def cmd_login(args: argparse.Namespace) -> int:
         if target.exists() and not args.force:
             raise SwapError(f"profile '{args.name}' already exists; use --force to replace it")
         live = auth_path()
-        if get_active() is None and live.exists() and not args.force:
+        previous_active = get_tracked_active()
+        if previous_active is None and live.exists() and not args.force:
             raise SwapError(
                 "the current Codex login is not associated with a saved profile; "
                 "save it with 'codex-swap add NAME' or use --force to overwrite it"
@@ -352,7 +361,6 @@ def cmd_login(args: argparse.Namespace) -> int:
         # The browser flow happened in an isolated CODEX_HOME, so the current
         # account was never logged out. Preserve its latest refresh token, then
         # activate the newly enrolled profile atomically.
-        previous_active = get_active()
         if previous_active and live.exists():
             save_live_profile(previous_active)
         atomic_write(target, payload)

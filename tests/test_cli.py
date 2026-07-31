@@ -52,9 +52,12 @@ class CliTests(unittest.TestCase):
     def install_fake_codex(self, label: str = "work") -> None:
         fake_bin = self.root / "bin"
         fake_bin.mkdir(exist_ok=True)
+        self.codex_call_log = self.root / "codex-calls.log"
+        self.env["CODEX_SWAP_TEST_CALL_LOG"] = str(self.codex_call_log)
         fake_codex = fake_bin / "codex"
         fake_codex.write_text(
             "#!/bin/sh\n"
+            "printf '%s\\n' \"$1\" >> \"$CODEX_SWAP_TEST_CALL_LOG\"\n"
             "if [ \"$1\" = \"logout\" ]; then exit 91; fi\n"
             "mkdir -p \"$CODEX_HOME\"\n"
             "printf '%s' '{\"auth_mode\":\"chatgpt\",\"tokens\":"
@@ -142,6 +145,31 @@ class CliTests(unittest.TestCase):
         live = json.loads((self.codex_home / "auth.json").read_text())
         self.assertEqual(live["tokens"]["access_token"], "fake-personal")
 
+    def test_switch_treats_missing_active_profile_as_untracked(self) -> None:
+        self.write_auth("personal")
+        self.run_cli("add", "personal")
+        self.write_auth("work")
+        self.run_cli("add", "work")
+        (self.swap_home / "profiles" / "work.json").unlink()
+
+        result = self.run_cli("switch", "personal", ok=False)
+        self.assertIn("not associated with a saved profile", result.stderr)
+        live = json.loads((self.codex_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-work")
+        self.assertFalse((self.swap_home / "profiles" / "work.json").exists())
+
+    def test_login_treats_missing_active_profile_as_untracked(self) -> None:
+        self.write_auth("personal")
+        self.run_cli("add", "personal")
+        (self.swap_home / "profiles" / "personal.json").unlink()
+        self.install_fake_codex("work")
+
+        result = self.run_cli("login", "work", ok=False)
+        self.assertIn("not associated with a saved profile", result.stderr)
+        self.assertFalse(self.codex_call_log.exists())
+        live = json.loads((self.codex_home / "auth.json").read_text())
+        self.assertEqual(live["tokens"]["access_token"], "fake-personal")
+
     def test_status_reports_malformed_credentials_without_failing(self) -> None:
         (self.codex_home / "auth.json").write_text("{broken")
 
@@ -193,6 +221,9 @@ class CliTests(unittest.TestCase):
         self.install_fake_codex("work")
 
         self.run_cli("login", "work")
+        calls = self.codex_call_log.read_text().splitlines()
+        self.assertIn("login", calls)
+        self.assertNotIn("logout", calls)
         live = json.loads((self.codex_home / "auth.json").read_text())
         saved_personal = json.loads(
             (self.swap_home / "profiles" / "personal.json").read_text()
